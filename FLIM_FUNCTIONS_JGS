@@ -1,0 +1,243 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun 18 13:57:54 2026
+
+@author: James
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Self-Contained FLIM Pipeline
+Extracts PTU data, runs headless Ilastik masking, calculates lifetimes,
+and generates batch summary visualizations without relying on PhasorPy.
+
+I think having the .ilp locally is better, in the C or D drive
+"""
+
+import os
+import glob
+import subprocess
+import numpy as np
+import pandas as pd
+import tifffile as tif
+import ptufile
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from scipy.ndimage import gaussian_filter
+
+# ==========================================
+# 1. CORE MATH & PROCESSING FUNCTIONS
+# ==========================================
+
+def load_ptu_channel(ptu_path, channel=1):
+    """Extracts image data and frequency for a specific channel from a PTU file."""
+    with ptufile.PtuFile(ptu_path) as ptu:
+        data = ptu.decode_image().astype(np.uint8)
+        frequency_ghz = ptu.frequency / 1e9  
+        
+    # Handle 4D (Y, X, C, T) or 5D (F, Y, X, C, T) shapes safely
+    ch_data = data[0, :, :, channel, :] if data.ndim == 5 else data[:, :, channel, :]
+    return ch_data, frequency_ghz
+
+def align_decay_to_peak(ch_data):
+    """Shifts the time-bin axis so the peak of the global decay histogram is at t=0."""
+    avg_hist = np.sum(ch_data, axis=(0, 1))
+    peak_idx = np.argmax(avg_hist)
+    shifted_data = np.roll(ch_data, shift=-peak_idx, axis=-1)
+    return shifted_data
+
+def calculate_raw_phasors(ch_data):
+    """Calculates manual G (real) and S (imaginary) phasors from time-domain data."""
+    intensity = np.sum(ch_data, axis=-1)
+    bins = ch_data.shape[-1]
+    
+    k = np.arange(bins)
+    angle = 2 * np.pi * k / bins
+    
+    real_raw = np.sum(ch_data * np.cos(angle), axis=-1)
+    imag_raw = np.sum(ch_data * np.sin(angle), axis=-1)
+    
+    return intensity, real_raw, imag_raw
+
+def smooth_and_calculate_lifetime(intensity, real_raw, imag_raw, frequency_ghz, smoothing_sigma=1.0):
+    """Applies Gaussian smoothing to phasors and computes apparent lifetime."""
+    valid_mask = intensity >= 3
+    
+    w_real_s = gaussian_filter(real_raw * valid_mask, sigma=smoothing_sigma)
+    w_imag_s = gaussian_filter(imag_raw * valid_mask, sigma=smoothing_sigma)
+    w_map_s = gaussian_filter(intensity * valid_mask.astype(float), sigma=smoothing_sigma)
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        real_s = w_real_s / w_map_s
+        imag_s = w_imag_s / w_map_s
+
+    omega = 2 * np.pi * frequency_ghz
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tau = np.divide(imag_s, (omega * real_s), out=np.zeros_like(real_s), where=real_s != 0)
+        tau[w_map_s <= 0] = np.nan
+        tau[(tau > 8) | (tau < 0.5)] = np.nan  
+        
+    return real_s, imag_s, tau
+
+def generate_ilastik_mask(intensity, tau, ptu_path, ilastik_exe, ilastik_proj, target_class=1):
+    """Packages intensity and lifetime into a TIFF, runs Ilastik safely, and returns the mask."""
+    intens_final = np.clip(intensity, 0, 65535).astype(np.uint16)
+    tau_safe = np.nan_to_num(tau, nan=0.0)
+    tau_final = np.clip(np.round(tau_safe * 1000), 0, 65535).astype(np.uint16)
+    
+    stacked_data = np.stack([intens_final, tau_final], axis=0)
+    
+    temp_dir = os.path.dirname(ptu_path)
+    temp_tif_path = os.path.join(temp_dir, "temp_2ch_input.tif")
+    mask_output_path = os.path.join(temp_dir, "temp_2ch_mask.tiff")
+    
+    tif.imwrite(temp_tif_path, stacked_data, imagej=True, photometric='minisblack', metadata={'axes': 'CYX'})
+    
+    ilastik_cmd = [
+        ilastik_exe, "--headless", f"--project={ilastik_proj}",
+        "--export_source=Simple Segmentation", "--output_format=tiff",
+        f"--output_filename_format={mask_output_path}", temp_tif_path
+    ]
+    
+    clean_env = os.environ.copy()
+    for key in ['MPLBACKEND', 'PYTHONPATH', 'PYTHONSTARTUP']:
+        clean_env.pop(key, None)
+        
+    subprocess.run(ilastik_cmd, capture_output=True, text=True, env=clean_env)
+    
+    bool_mask = None
+    if os.path.exists(mask_output_path):
+        ilastik_mask = tif.imread(mask_output_path)
+        bool_mask = (ilastik_mask == target_class)
+        os.remove(temp_tif_path)
+        os.remove(mask_output_path)
+    else:
+        if os.path.exists(temp_tif_path): os.remove(temp_tif_path)
+        
+    return bool_mask
+
+def plot_manual_phasor(real_array, imag_array, freq_ghz, ax, title="Universal Phasor Semicircle"):
+    """Plots a 2D histogram of phasor data onto the universal semicircle mathematically."""
+    if len(real_array) > 0:
+        ax.hist2d(real_array, imag_array, bins=100, cmap='turbo', norm=LogNorm(), range=[[0, 1], [0, 0.6]])
+    else:
+        ax.text(0.5, 0.5, "No valid data in mask", ha='center', va='center')
+
+    # Draw Semicircle
+    theta = np.linspace(0, np.pi, 200)
+    ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta), color='black', linestyle='--', linewidth=1.5, alpha=0.8)
+
+    # Draw Markers
+    omega = 2 * np.pi * freq_ghz
+    for tau in [0.5, 1, 2, 3, 4, 6, 8, 10]:
+        wt = omega * tau
+        g_marker, s_marker = 1 / (1 + wt**2), wt / (1 + wt**2)
+        ax.plot(g_marker, s_marker, marker='o', color='black', markersize=4, markeredgecolor='black')
+        ax.text(g_marker, s_marker + 0.025, f"{tau}ns", color='black', fontsize=8, ha='center', va='bottom',
+                )
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 0.6)
+    ax.set_aspect('equal')
+    ax.set_xlabel('G (Real)')
+    ax.set_ylabel('S (Imaginary)')
+    ax.set_title(title)
+
+def process_flim_pipeline(ptu_path, ilastik_exe, ilastik_proj, target_class=1, channel=0):
+    """Master function: Executes the entire FLIM extraction and masking pipeline."""
+    ch_data, freq = load_ptu_channel(ptu_path, channel)
+    aligned_data = align_decay_to_peak(ch_data)
+    intensity, real_raw, imag_raw = calculate_raw_phasors(aligned_data)
+    real_s, imag_s, tau = smooth_and_calculate_lifetime(intensity, real_raw, imag_raw, freq)
+    mask = generate_ilastik_mask(intensity, tau, ptu_path, ilastik_exe, ilastik_proj, target_class)
+    return mask, intensity, tau, real_s, imag_s, freq
+
+#%%
+# ==========================================
+# 2. BATCH EXECUTION LOOP
+# ==========================================
+
+EXE = r'D:\Local Software Files\ilastik-1.4.2-gpu\ilastik.exe'
+ILP = r"C:\Users\KellyLab\Downloads\Model for James_2_updted.ilp"
+superfolder = r"Y:\For James\2026-06-09 rerun of plin concentration PM flipper\1_200"
+
+ptu_files = glob.glob(os.path.join(superfolder, "**", "*.ptu"), recursive=True)
+print(f"Found {len(ptu_files)} PTU files to process.")
+
+summary_results = []
+taus_life = []
+for file_path in ptu_files:
+    print(f"\n======================================")
+    print(f"Processing: {os.path.basename(file_path)}")
+    try:
+        mask, intensity, tau, real_s, imag_s, freq = process_flim_pipeline(
+            file_path, ilastik_exe=EXE, ilastik_proj=ILP, target_class=1, channel=1
+        )
+        
+        if mask is None or not np.any(mask):
+            print(f" -> Skipping: Mask failed or empty.")
+            continue
+
+        # Apply mask safely
+        cap_tau = np.where(mask, tau, np.nan) 
+        cap_intens = np.where(mask, intensity, 0)
+        
+        avg_cap_tau = np.nanmean(cap_tau)
+        taus_life.append(avg_cap_tau)
+        total_cap_intens = np.sum(cap_intens)
+        print(f" -> SUCCESS: Lifetime = {avg_cap_tau:.3f} ns")
+        
+        summary_results.append({
+            'File': os.path.basename(file_path),
+            'Folder': os.path.basename(os.path.dirname(file_path)),
+            'Avg_Tau_ns': avg_cap_tau,
+            'Total_Cap_Photons': total_cap_intens
+        })
+
+        # --- VISUALIZATION ---
+        fig, axs = plt.subplots(2, 2, figsize=(12, 10), dpi=100)
+        
+        # 1. Raw Intensity
+        im0 = axs[0, 0].imshow(intensity, cmap='turbo', origin='lower')
+        fig.colorbar(im0, ax=axs[0, 0])
+        axs[0, 0].set_title('Raw Intensity from PTU')
+        
+        # 2. Masked Intensity
+        im1 = axs[0, 1].imshow(cap_intens, cmap='turbo', origin='lower')
+        fig.colorbar(im1, ax=axs[0, 1])
+        axs[0, 1].set_title('Ilastik Masked Intensity')
+        
+        # 3. Masked Lifetime (Dynamic Limits)
+        valid_tau = cap_tau[~np.isnan(cap_tau)]
+        if len(valid_tau) > 0:
+            v_min, v_max = np.percentile(valid_tau, [2, 98])
+            v_min, v_max = max(v_min, 0.5), min(v_max, 8.0)
+            if v_min == v_max: v_max += 0.5
+        else:
+            v_min, v_max = 0.5, 8.0
+
+        im2 = axs[1, 0].imshow(cap_tau, cmap='gnuplot2', origin='lower', vmin=v_min, vmax=v_max)
+        fig.colorbar(im2, ax=axs[1, 0])
+        axs[1, 0].set_title('Masked Lifetime (ns)')
+        
+        # 4. Manual Phasor Plot
+        real_masked = real_s[mask.astype(bool)]
+        imag_masked = imag_s[mask.astype(bool)]
+        plot_manual_phasor(real_masked, imag_masked, freq, ax=axs[1, 1], title="Phasor of Masked Sample")
+
+        plt.tight_layout()
+        plot_path = f"{file_path[:-4]}_summary.png"
+        plt.savefig(plot_path)
+        plt.close(fig) 
+        print(f" -> Saved plot: {os.path.basename(plot_path)}")
+
+    except Exception as e:
+        print(f" -> CRITICAL ERROR: {e}")
+
+print("\nBatch Processing Complete!")
+
+if summary_results:
+    df = pd.DataFrame(summary_results).dropna(subset=['Avg_Tau_ns'])
+    csv_path = os.path.join(superfolder, "Final_Batch_Results.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved numerical results to: {csv_path}")

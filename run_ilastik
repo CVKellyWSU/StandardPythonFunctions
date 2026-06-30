@@ -1,0 +1,76 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun  4 11:12:55 2026
+
+@author: KellyLab
+
+James: Trying to get ilastik to work on python, via the gpu app version using a headless comand prompt 6/4/2026
+
+"""
+import os
+# Force the environment variable directly in Python
+os.environ["MPLBACKEND"] = "TkAgg"
+import subprocess
+import os
+import tifffile # pip install tifffile
+import numpy as np
+
+
+def run_ilastik_masking(ilastik_exec, project_file, input_image, output_dir):
+    """
+    Runs an ilastik pixel classification project headless to generate a mask.
+    """
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Define the output format and naming convention
+    # {nickname} grabs the original file name without the extension
+    output_pattern = os.path.join(output_dir, "{nickname}_mask.tiff")
+    
+    # Build the command list
+    cmd = [
+        ilastik_exec,
+        "--headless",
+        f"--project={project_file}",
+        "--export_source=Simple Segmentation", # Use "Probabilities" if you want raw confidence maps
+        "--output_format=tiff",
+        f"--output_filename_format={output_pattern}",
+        input_image
+    ]
+    
+    print(f"Running ilastik on {input_image}...")
+    
+    # Execute the command
+    try:
+        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print("ilastik processing complete!")
+    except subprocess.CalledProcessError as e:
+        print(f"Error running ilastik:\n{e.stderr}")
+        return None
+
+    # Reconstruct the expected output path to load it back into Python
+    base_name = os.path.splitext(os.path.basename(input_image))[0]
+    expected_output_path = os.path.join(output_dir, f"{base_name}_mask.tiff")
+    
+    # Load the mask as a numpy array
+    if os.path.exists(expected_output_path):
+        mask = tifffile.imread(expected_output_path)
+        return mask
+    else:
+        print("Output mask not found. Check ilastik export settings.")
+        return None
+
+# --- Configuration ---
+# Point this to your run_ilastik.sh (Linux/Mac) or ilastik.exe (Windows)
+ILASTIK_PATH = r"D:\Local Software Files\ilastik-1.4.2-gpu\Scripts\ilastik.exe"
+PROJECT_PATH = r"C:\Users\KellyLab\Downloads\LD or Not-LD.ilp"
+IMAGE_TO_MASK = "D:\JamesS\Ilastik\Images with LDs\IMG0037_SR3420 T-series 2_ROI04\IMG0037_SR3420 T-series 2_ROI04_ER flipper.Confocal.ome.tif"
+OUTPUT_FOLDER = "D:\JamesS\Ilastik\Images with LDs\IMG0037_SR3420 T-series 2_ROI04\output ilastik"
+
+# --- Execution ---
+cell_mask = run_ilastik_masking(ILASTIK_PATH, PROJECT_PATH, IMAGE_TO_MASK, OUTPUT_FOLDER)
+
+if cell_mask is not None:
+    print(f"Mask loaded successfully! Shape: {cell_mask.shape}, Type: {cell_mask.dtype}")
+    # You can now process the NumPy array `cell_mask` 
+    # e.g., using scipy.ndimage or skimage.measure for cell counting/measurements

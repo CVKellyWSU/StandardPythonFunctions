@@ -241,3 +241,67 @@ if summary_results:
     csv_path = os.path.join(superfolder, "Final_Batch_Results.csv")
     df.to_csv(csv_path, index=False)
     print(f"Saved numerical results to: {csv_path}")
+
+
+=========================================================
+RUN BELOW CODE TO QUICKLY SEE A PTU FILE
+=========================================================
+
+Reads a PicoQuant .ptu file, integrates the TCSPC histogram data, 
+and visualizes the total photon intensity as a 2D image.
+
+This script opens a specified `.ptu` file using `ptufile` and extracts 
+the multi-dimensional array containing the raw photon counting data. It 
+calculates the total intensity per pixel by summing across the microtime 
+(delay time) histogram axis and displays the resulting spatial image.
+
+Dependencies
+------------
+ptufile, numpy, matplotlib
+
+Configuration
+-------------
+file_path : str
+    The absolute path to the target `.ptu` file to be loaded and analyzed.
+
+Outputs
+-------
+Plot
+    Displays a matplotlib figure representing the spatially resolved total 
+    photon counts using the 'viridis' colormap, complete with a colorbar 
+    and title.
+
+Notes
+-----
+- The native dimensionality of the `ptu[:]` extraction is typically structured 
+  as (Frame, Y, X, Channel, Histogram). 
+- The script utilizes `np.sum(..., axis=-1)` to collapse the final Histogram (H) 
+  axis, effectively aggregating all photon arrival time-bins into a single 
+  intensity scalar for each pixel.
+"""
+
+
+import ptufile
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Replace with the path to your .ptu file
+file_path = r"C:/PhotonStreams/2026-06-11 ABHD5 and PLIN5 lysates/IMG0004_A_ and pLIN5 1_100/PQSpcmDriver_2026-06-11_11-05-13.962.ptu"
+
+with ptufile.PtuFile(file_path) as ptu:
+    # ptu[:] loads the histogram data. 
+    # The standard dimensions are (T, Y, X, C, H):
+    # T: Frame, Y/X: Spatial, C: Channel, H: Histogram (delay time)
+    data = ptu[:]
+    
+    # Select Frame 0, all Y, all X, Channel 0, all H
+    # Then sum across the 'H' axis (-1) to calculate total photon intensity per pixel
+    intensity_image = np.sum(data[:, :, :], axis=-1)
+
+# Display the image
+plt.figure(figsize=(6, 6))
+plt.imshow(intensity_image, cmap='viridis')
+plt.colorbar(label='Total Photon Counts')
+plt.title('PTU Intensity Image')
+plt.axis('off')
+plt.show()
